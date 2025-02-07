@@ -1,0 +1,7 @@
+[package]
+name = "btc_processor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitcoind = { version = "0.34.1", features = ["22_1"] }
