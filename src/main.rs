@@ -1,15 +1,16 @@
 use std::{thread, time::Duration};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, RwLock};
 use bitcoind::bitcoincore_rpc::{bitcoin::{Amount, BlockHash}, json, Client, RpcApi};
 use bitcoind::bitcoincore_rpc::bitcoin::{Address, Txid};
 use bitcoind::BitcoinD;
 use crossbeam_channel::unbounded;
-use rand::{rng, thread_rng, Rng};
+use rand::{rng, Rng};
 use rand::rngs::ThreadRng;
 use rand::seq::index::sample;
 use uuid::Uuid;
+use dashmap::DashMap;
 
 #[derive(Debug)]
 pub struct Wallet {
@@ -80,7 +81,6 @@ fn generate_random_transaction(wallets: &Vec<Wallet>, rng: &mut ThreadRng) -> Tx
 fn generate_random_simulated_transaction(wallets: &Vec<Wallet>, rng: &mut ThreadRng) -> RandomTx {
     let indices = sample(rng, wallets.len(), 2);
     let amount: u64 = rng.random_range(1..1_000_000_000);
-    println!("amount: {:?}", amount);
     RandomTx {
         unique_id: Uuid::new_v4(),
         sender: wallets[indices.index(0)].address.clone(),
@@ -105,9 +105,17 @@ fn main() {
 
     let (sender, receiver) = unbounded();
 
-    let mut map: HashMap<Address, Amount> = HashMap::new();
-    let mut unique_ids: HashSet<Uuid> = HashSet::new();
+    let map: DashMap<Address, Amount> = DashMap::new();
+    
+    let mut unique_ids = Arc::new(RwLock::new(HashSet::new()));
 
+    // initialize map with the balances of wallets
+    for wallet in &wallets {
+        let balance = cl.get_balances().unwrap();
+        map.insert(wallet.address.clone(), balance.mine.trusted.clone());
+    }
+    
+    
     thread::scope(
         |scope| {
             scope.spawn( || {
@@ -138,38 +146,43 @@ fn main() {
                             let receiver_address = &random_tx.receiver;
                             let amount = &random_tx.amount;
                             if amount.le(&Amount::ZERO) {
+                                println!("invalid amount");
                                 continue;
                             }
+                            let unique_ids_clone = Arc::clone(&unique_ids);
+                            let unique_ids = unique_ids_clone.read().unwrap();
                             if unique_ids.contains(&random_tx.unique_id) {
                                 println!("no way to double spending!!");
                                 continue;
                             }
-                            unique_ids.insert(random_tx.unique_id);
-                            for wallet in &wallets {
-                                if wallet.address.eq(sender_address) {
-                                    let balance = wallet.client.get_balances().unwrap();
-                                    println!("balance: {:?}", balance);
-                                    if balance.mine.trusted.lt(amount) {
-                                        println!("insufficient balance!");
-                                    } else {
-                                        if map.contains_key(sender_address) {
-                                            let current = map.get_mut(sender_address).unwrap();
-                                            *current -= *amount;
-                                        } else {
-                                            map.insert(sender_address.clone(), balance.mine.trusted - *amount);
-                                        }
-                                    }
-                                    break;
-                                } else if wallet.address.eq(receiver_address) {
-                                    if map.contains_key(receiver_address) {
-                                        let current = map.get_mut(receiver_address).unwrap();
-                                        *current += *amount;
-                                    } else {
-                                        let balance = wallet.client.get_balances().unwrap();
-                                        map.insert(receiver_address.clone(), balance.mine.trusted + *amount);
-                                    }
-                                }
+                            drop(unique_ids);
+                            unique_ids_clone.write().unwrap().insert(random_tx.unique_id);
+                            let index_sender = wallets.iter()
+                                .position(|w| w.address.eq(sender_address));
+                            let index_receiver = wallets.iter()
+                                .position(|w| w.address.eq(receiver_address));
+                            if index_sender.is_none() || index_receiver.is_none() {
+                                println!("invalid addresses for sender/receiver!");
+                                continue;
                             }
+                            let index_sender = index_sender.unwrap();
+                            let index_receiver = index_receiver.unwrap();
+                            
+                            let send_result = wallets[index_sender].client.send_to_address(
+                                &wallets[index_receiver].address,
+                                amount.clone(),
+                                None, None, None, None, None, None);
+                            if send_result.is_err() {
+                                println!("insufficient balance!");
+                                continue;
+                            }
+                            let balance_sender = wallets[index_sender].client.get_balances().unwrap();
+                            map.insert(sender_address.clone(), balance_sender.mine.trusted.clone());
+                            
+                            let mut receiver_current = map.get_mut(&receiver_address).unwrap();
+                            *receiver_current += *amount;
+                            
+                            // cl.generate_to_address(1, &sender_address).unwrap();
                         }
                         Err(_) => {
                             break;
