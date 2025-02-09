@@ -5,3 +5,4 @@ services:
     environment:
       - num_transactions=0  # if 0, it will execute forever
       - estimated_tx_time_in_millis=300  # an estimated delay between every transaction
+      - consumer_threads=5
