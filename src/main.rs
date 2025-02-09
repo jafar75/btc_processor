@@ -2,10 +2,12 @@ use std::{thread, time::Duration};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{mpsc, Arc, RwLock};
+use std::sync::atomic::{AtomicU16, AtomicU8};
+use std::sync::atomic::Ordering::Relaxed;
 use bitcoind::bitcoincore_rpc::{bitcoin::{Amount, BlockHash}, json, Client, RpcApi};
 use bitcoind::bitcoincore_rpc::bitcoin::{Address, Txid};
 use bitcoind::BitcoinD;
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded, Receiver};
 use rand::{rng, Rng};
 use rand::rngs::ThreadRng;
 use rand::seq::index::sample;
@@ -104,10 +106,16 @@ fn main() {
     initialize_wallets(&mut wallets, 100, &bitcoind);
 
     let (sender, receiver) = unbounded();
+    
+    let mut receiver_handles: Vec<(Receiver<RandomTx>, u32)> = Vec::new();
+    receiver_handles.push((receiver.clone(), 0));
+    for i in 1..5 {
+        receiver_handles.push((receiver.clone(), i));
+    }
 
     let map: DashMap<Address, Amount> = DashMap::new();
     
-    let mut unique_ids = Arc::new(RwLock::new(HashSet::new()));
+    let unique_ids = Arc::new(RwLock::new(HashSet::new()));
 
     // initialize map with the balances of wallets
     for wallet in &wallets {
@@ -115,6 +123,8 @@ fn main() {
         map.insert(wallet.address.clone(), balance.mine.trusted.clone());
     }
     
+    let num_valid_transactions = AtomicU16::new(0);
+    let receiver_down = AtomicU8::new(0);
     
     thread::scope(
         |scope| {
@@ -124,69 +134,90 @@ fn main() {
                 loop {
                     let tx_id = generate_random_simulated_transaction(&wallets, &mut rng);
                     sender.send(tx_id).unwrap();
-                    thread::sleep(Duration::from_secs(1));
-                    if cnt > 100 {
+                    thread::sleep(Duration::from_millis(20));
+                    if cnt > 200 {
                         drop(sender);
                         break;
                     }
                     cnt += 1;
                 }
             });
+            
+            for i in 0..receiver_handles.len() {
+                let receiver_data = &receiver_handles[i];
+                scope.spawn( || {
+                    loop {
+                        println!("thread_index: {:?}", receiver_data.1);
+                        let x = receiver_data.0.recv_timeout(Duration::from_secs(5));
+                        match x {
+                            Ok(random_tx) => {
+                                println!("random_tx: {:?}", random_tx);
+                                // now using addresses of sender and receiver, find the wallet and
+                                // then using rpc calls, check the balance, positivity of amount, etc
+                                // also check the uuid to prevent double spending
+                                let sender_address = &random_tx.sender;
+                                let receiver_address = &random_tx.receiver;
+                                let amount = &random_tx.amount;
+                                if amount.le(&Amount::ZERO) {
+                                    println!("invalid amount");
+                                    continue;
+                                }
+                                let unique_ids_clone = Arc::clone(&unique_ids);
+                                let unique_ids = unique_ids_clone.read().unwrap();
+                                if unique_ids.contains(&random_tx.unique_id) {
+                                    println!("no way to double spending!!");
+                                    continue;
+                                }
+                                drop(unique_ids);
+                                unique_ids_clone.write().unwrap().insert(random_tx.unique_id);
+                                let index_sender = wallets.iter()
+                                    .position(|w| w.address.eq(sender_address));
+                                let index_receiver = wallets.iter()
+                                    .position(|w| w.address.eq(receiver_address));
+                                if index_sender.is_none() || index_receiver.is_none() {
+                                    println!("invalid addresses for sender/receiver!");
+                                    continue;
+                                }
+                                let index_sender = index_sender.unwrap();
+                                let index_receiver = index_receiver.unwrap();
 
-            scope.spawn( || {
+                                let send_result = wallets[index_sender].client.send_to_address(
+                                    &wallets[index_receiver].address,
+                                    amount.clone(),
+                                    None, None, None, None, None, None);
+                                if send_result.is_err() {
+                                    println!("insufficient balance!");
+                                    continue;
+                                }
+                                let balance_sender = wallets[index_sender].client.get_balances().unwrap();
+                                map.insert(sender_address.clone(), balance_sender.mine.trusted.clone());
+
+                                let mut receiver_current = map.get_mut(&receiver_address).unwrap();
+                                *receiver_current += *amount;
+                                
+                                num_valid_transactions.fetch_add(1, Relaxed);
+                            }
+                            Err(_) => {
+                                receiver_down.fetch_add(1, Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            
+            scope.spawn(|| {
                 loop {
-                    let x = receiver.recv_timeout(Duration::from_secs(5));
-                    match x {
-                        Ok(random_tx) => {
-                            println!("random_tx: {:?}", random_tx);
-                            // now using addresses of sender and receiver, find the wallet and
-                            // then using rpc calls, check the balance, positivity of amount, etc
-                            // also check the uuid to prevent double spending
-                            let sender_address = &random_tx.sender;
-                            let receiver_address = &random_tx.receiver;
-                            let amount = &random_tx.amount;
-                            if amount.le(&Amount::ZERO) {
-                                println!("invalid amount");
-                                continue;
-                            }
-                            let unique_ids_clone = Arc::clone(&unique_ids);
-                            let unique_ids = unique_ids_clone.read().unwrap();
-                            if unique_ids.contains(&random_tx.unique_id) {
-                                println!("no way to double spending!!");
-                                continue;
-                            }
-                            drop(unique_ids);
-                            unique_ids_clone.write().unwrap().insert(random_tx.unique_id);
-                            let index_sender = wallets.iter()
-                                .position(|w| w.address.eq(sender_address));
-                            let index_receiver = wallets.iter()
-                                .position(|w| w.address.eq(receiver_address));
-                            if index_sender.is_none() || index_receiver.is_none() {
-                                println!("invalid addresses for sender/receiver!");
-                                continue;
-                            }
-                            let index_sender = index_sender.unwrap();
-                            let index_receiver = index_receiver.unwrap();
-                            
-                            let send_result = wallets[index_sender].client.send_to_address(
-                                &wallets[index_receiver].address,
-                                amount.clone(),
-                                None, None, None, None, None, None);
-                            if send_result.is_err() {
-                                println!("insufficient balance!");
-                                continue;
-                            }
-                            let balance_sender = wallets[index_sender].client.get_balances().unwrap();
-                            map.insert(sender_address.clone(), balance_sender.mine.trusted.clone());
-                            
-                            let mut receiver_current = map.get_mut(&receiver_address).unwrap();
-                            *receiver_current += *amount;
-                            
-                            // cl.generate_to_address(1, &sender_address).unwrap();
-                        }
-                        Err(_) => {
-                            break;
-                        }
+                    thread::sleep(Duration::from_millis(100));
+                    if num_valid_transactions.load(Relaxed) > 50 {
+                        num_valid_transactions.store(0, Relaxed);
+                        let block_hash = cl.generate_to_address(1, &wallets[0].address).unwrap();
+                        println!("blockhash: {:?}", block_hash);
+                        let bb = cl.get_block(block_hash.last().unwrap()).unwrap();
+                        println!("block tx len: {:?}", bb.txdata.len());
+                    }
+                    if receiver_down.load(Relaxed) == receiver_handles.len() as u8 {
+                        break;
                     }
                 }
             });
