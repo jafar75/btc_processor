@@ -1,5 +1,5 @@
 use std::{thread, time::Duration};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::mpsc;
 use bitcoind::bitcoincore_rpc::{bitcoin::{Amount, BlockHash}, json, Client, RpcApi};
@@ -106,6 +106,7 @@ fn main() {
     let (sender, receiver) = unbounded();
 
     let mut map: HashMap<Address, Amount> = HashMap::new();
+    let mut unique_ids: HashSet<Uuid> = HashSet::new();
 
     thread::scope(
         |scope| {
@@ -116,7 +117,7 @@ fn main() {
                     let tx_id = generate_random_simulated_transaction(&wallets, &mut rng);
                     sender.send(tx_id).unwrap();
                     thread::sleep(Duration::from_secs(1));
-                    if cnt > 10 {
+                    if cnt > 100 {
                         drop(sender);
                         break;
                     }
@@ -134,10 +135,16 @@ fn main() {
                             // then using rpc calls, check the balance, positivity of amount, etc
                             // also check the uuid to prevent double spending
                             let sender_address = &random_tx.sender;
+                            let receiver_address = &random_tx.receiver;
                             let amount = &random_tx.amount;
                             if amount.le(&Amount::ZERO) {
                                 continue;
                             }
+                            if unique_ids.contains(&random_tx.unique_id) {
+                                println!("no way to double spending!!");
+                                continue;
+                            }
+                            unique_ids.insert(random_tx.unique_id);
                             for wallet in &wallets {
                                 if wallet.address.eq(sender_address) {
                                     let balance = wallet.client.get_balances().unwrap();
@@ -153,18 +160,16 @@ fn main() {
                                         }
                                     }
                                     break;
+                                } else if wallet.address.eq(receiver_address) {
+                                    if map.contains_key(receiver_address) {
+                                        let current = map.get_mut(receiver_address).unwrap();
+                                        *current += *amount;
+                                    } else {
+                                        let balance = wallet.client.get_balances().unwrap();
+                                        map.insert(receiver_address.clone(), balance.mine.trusted + *amount);
+                                    }
                                 }
                             }
-
-                            // let tx_id = Txid::from_str(&random_tx).unwrap();
-                            // let r = cl.get_raw_transaction_hex(&tx_id, None).unwrap();
-                            // let d = cl.decode_raw_transaction(r, None).unwrap();
-                            // println!("d     {:?}\n\n\n", d);
-                            //
-                            // let i = d.vin.last().unwrap().txid.unwrap();
-                            // let r_i = cl.get_raw_transaction_hex(&i, None).unwrap();
-                            // let d_i = cl.decode_raw_transaction(r_i, None).unwrap();
-                            // println!("d_i   {:?}\n\n\n", d_i);
                         }
                         Err(_) => {
                             break;
@@ -178,6 +183,18 @@ fn main() {
     println!("wallet balances: {:?}", map);
 
 //////////////////////////////////////////////////////////////////////////////////
+    // let tx_id = Txid::from_str(&random_tx).unwrap();
+    // let r = cl.get_raw_transaction_hex(&tx_id, None).unwrap();
+    // let d = cl.decode_raw_transaction(r, None).unwrap();
+    // println!("d     {:?}\n\n\n", d);
+    //
+    // let i = d.vin.last().unwrap().txid.unwrap();
+    // let r_i = cl.get_raw_transaction_hex(&i, None).unwrap();
+    // let d_i = cl.decode_raw_transaction(r_i, None).unwrap();
+    // println!("d_i   {:?}\n\n\n", d_i);
+
+//////////////////////////////////////////////////////
+
 //     let alice = bitcoind.create_wallet("alice").unwrap();
 //     let bob = bitcoind.create_wallet("bob").unwrap();
 //
