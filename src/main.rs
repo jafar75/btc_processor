@@ -1,4 +1,4 @@
-use std::{thread, time::Duration};
+use std::{env, thread, time::Duration};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{mpsc, Arc, RwLock};
@@ -106,7 +106,7 @@ fn main() {
     initialize_wallets(&mut wallets, 100, &bitcoind);
 
     let (sender, receiver) = unbounded();
-    
+
     let mut receiver_handles: Vec<(Receiver<RandomTx>, u32)> = Vec::new();
     receiver_handles.push((receiver.clone(), 0));
     for i in 1..5 {
@@ -114,7 +114,7 @@ fn main() {
     }
 
     let map: DashMap<Address, Amount> = DashMap::new();
-    
+
     let unique_ids = Arc::new(RwLock::new(HashSet::new()));
 
     // initialize map with the balances of wallets
@@ -122,10 +122,20 @@ fn main() {
         let balance = cl.get_balances().unwrap();
         map.insert(wallet.address.clone(), balance.mine.trusted.clone());
     }
-    
+
     let num_valid_transactions = AtomicU16::new(0);
     let receiver_down = AtomicU8::new(0);
     
+    let num_transactions = env::var("num_transactions")
+        .unwrap_or("0".to_string()).parse::<u32>().unwrap();
+    let limit = num_transactions != 0u32;
+    
+    let base_tx_time = env::var("estimated_tx_time_in_millis")
+        .unwrap_or("300".to_string()).parse::<u64>().unwrap();
+    let scale: f32 = rng().random_range(0.9..1.1);
+    let tx_time: u64 = (base_tx_time as f32 * scale) as u64;
+    
+
     thread::scope(
         |scope| {
             scope.spawn( || {
@@ -134,15 +144,16 @@ fn main() {
                 loop {
                     let tx_id = generate_random_simulated_transaction(&wallets, &mut rng);
                     sender.send(tx_id).unwrap();
-                    thread::sleep(Duration::from_millis(20));
-                    if cnt > 200 {
-                        drop(sender);
-                        break;
+                    thread::sleep(Duration::from_millis(tx_time));
+                    if limit {
+                        if cnt > num_transactions {
+                            break;
+                        }
                     }
                     cnt += 1;
                 }
             });
-            
+
             for i in 0..receiver_handles.len() {
                 let receiver_data = &receiver_handles[i];
                 scope.spawn( || {
@@ -194,7 +205,7 @@ fn main() {
 
                                 let mut receiver_current = map.get_mut(&receiver_address).unwrap();
                                 *receiver_current += *amount;
-                                
+
                                 num_valid_transactions.fetch_add(1, Relaxed);
                             }
                             Err(_) => {
@@ -205,7 +216,7 @@ fn main() {
                     }
                 });
             }
-            
+
             scope.spawn(|| {
                 loop {
                     thread::sleep(Duration::from_millis(100));
